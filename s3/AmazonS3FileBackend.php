@@ -22,7 +22,6 @@
  */
 
 use Aws\S3\S3Client;
-use Aws\S3\Enum\CannedAcl;
 use Aws\S3\Exception\BucketNotEmptyException;
 use Aws\S3\Exception\NoSuchBucketException;
 use Aws\S3\Exception\NoSuchKeyException;
@@ -76,7 +75,7 @@ class AmazonS3FileBackend extends FileBackendStore {
 
 		parent::__construct( $config );
 
-		$this->encryption = isset( $config['awsEncryption'] ) ? (bool)$config['awsEncryption'] : false;
+		$this->encryption = isset( $config['awsEncryption'] ) ? (bool)$config['awsEncryption'] : true;
 
 		if ( $this->encryption ) {
 			$this->useHTTPS = true;
@@ -91,13 +90,18 @@ class AmazonS3FileBackend extends FileBackendStore {
 			$this->memCache = $config['wanCache'];
 		}
 
+		$key = isset($config['awsKey']) ? $config['awsKey'] : (isset($wgAWSCredentials['key']) ? $wgAWSCredentials['key'] : null);
+		$secret = isset($config['awsSecret']) ? $config['awsSecret'] : (isset($wgAWSCredentials['secret']) ? $wgAWSCredentials['secret'] : null);
+		$token = isset($config['awsToken']) ? $config['awsToken'] : (isset($wgAWSCredentials['token']) ? $wgAWSCredentials['token'] : null);
+
 		$this->client = S3Client::factory( array(
-			'key' => isset( $config['awsKey'] ) ? $config['awsKey'] : $wgAWSCredentials['key'],
-			'secret' => isset( $config['awsSecret'] ) ? $config['awsSecret'] : $wgAWSCredentials['secret'],
-			'token' => isset( $config['awsToken'] ) ? $config['awsToken'] : $wgAWSCredentials['token'],
+			'key' => $key,
+			'secret' => $secret,
+			'token' => $token,
 			'region' => isset( $config['awsRegion'] ) ? $config['awsRegion'] : $wgAWSRegion,
 			'scheme' => $this->useHTTPS ? 'https' : 'http',
-			'ssl.certificate_authority' => $this->useHTTPS ?: null
+			'ssl.certificate_authority' => $this->useHTTPS ?: null,
+			'version' => '2006-03-01'
 		) );
 
 		if ( isset( $config['containerPaths'] ) ) {
@@ -113,26 +117,34 @@ class AmazonS3FileBackend extends FileBackendStore {
 
 	function isPathUsableInternal( $storagePath ) {
 		list( $container, $rel ) = $this->resolveStoragePathReal( $storagePath );
-		return $container !== null && $this->client->doesBucketExist( $container );
+		return $container !== null;
 	}
 
 	function resolveContainerName( $container ) {
-		if (
-			isset( $this->containerPaths[$container] ) &&
-			$this->client->isValidBucketName( $this->containerPaths[$container] )
-		) {
-			return $this->containerPaths[$container];
-		} else {
+		if (!isset($this->containerPaths[$container])) {
 			return null;
 		}
+		list($bucket) = explode('/', $this->containerPaths[$container]);
+		if (!$this->client->isBucketDnsCompatible($bucket)) {
+			return null;
+		}
+		return $bucket;
 	}
 
-	function resolveContainerPath( $container, $relStoragePath ) {
-		if ( strlen( urlencode( $relStoragePath ) ) <= 1024 ) {
-			return $relStoragePath;
-		} else {
+	function resolveContainerPath( $shortCont, $relStoragePath ) {
+		$container = $this->fullContainerName( $shortCont );
+		if (!isset($this->containerPaths[$container])) {
 			return null;
 		}
+		if ( strlen( urlencode( $relStoragePath ) ) > 1024 ) {
+			return null;
+		}
+		$basePath = '';
+		$pos = strpos($this->containerPaths[$container], '/');
+		if ($pos !== false) {
+			$basePath = substr($this->containerPaths[$container], $pos+1);
+		}
+		return "$basePath/$relStoragePath";
 	}
 
 	function doCreateInternal( array $params ) {
@@ -164,8 +176,7 @@ class AmazonS3FileBackend extends FileBackendStore {
 		}
 
 		try {
-			$res = $this->client->putObject( array(
-				'ACL' => $this->isSecure( $container ) ? CannedAcl::PRIVATE_ACCESS : CannedAcl::PUBLIC_READ,
+			$apiParams = [
 				'Body' => $params['content'],
 				'Bucket' => $container,
 				'CacheControl' => $params['headers']['Cache-Control'],
@@ -177,7 +188,14 @@ class AmazonS3FileBackend extends FileBackendStore {
 				'Key' => $key,
 				'Metadata' => array( 'sha1base36' => $sha1Hash ),
 				'ServerSideEncryption' => $this->encryption ? 'AES256' : null,
-			) );
+			];
+			// passing null params breaks AWS client
+			foreach ($apiParams as $k => $v) {
+				if ($v === null) {
+					unset($apiParams[$k]);
+				}
+			}
+			$res = $this->client->putObject($apiParams);
 		} catch ( NoSuchBucketException $e ) {
 			$status->fatal( 'backend-fail-create', $params['dst'] );
 		} catch ( S3Exception $e ) {
@@ -222,7 +240,6 @@ class AmazonS3FileBackend extends FileBackendStore {
 
 		try {
 			$res = $this->client->copyObject( array_filter( array(
-				'ACL' => $this->isSecure( $dstContainer ) ? CannedAcl::PRIVATE_ACCESS : CannedAcl::PUBLIC_READ,
 				'Bucket' => $dstContainer,
 				'CacheControl' => $params['headers']['Cache-Control'],
 				'ContentDisposition' => $params['headers']['Content-Disposition'],
@@ -278,9 +295,7 @@ class AmazonS3FileBackend extends FileBackendStore {
 	}
 
 	function doDirectoryExists( $container, $dir, array $params ) {
-		// See if at least one file is in the directory.
-		$it = new AmazonS3FileIterator( $this->client, $container, $dir, array(), 1 );
-		return $it->valid();
+		return true;
 	}
 
 	function doGetFileStat( array $params ) {
@@ -322,13 +337,7 @@ class AmazonS3FileBackend extends FileBackendStore {
 		if( $container === null ) {
 			return null;
 		}
-
-		try {
-			$request = $this->client->get( "$container/$key" );
-			return $this->client->createPresignedUrl( $request, '+1 day' );
-		} catch ( S3Exception $e ) {
-			return null;
-		}
+		return $this->client->getObjectUrl($container, $key);
 	}
 
 	function getDirectoryListInternal( $container, $dir, array $params ) {
@@ -379,30 +388,7 @@ class AmazonS3FileBackend extends FileBackendStore {
 
 
 	function doPrepareInternal( $container, $dir, array $params ) {
-		$status = Status::newGood();
-
-		if( !$this->client->doesBucketExist( $container ) ) {
-			try {
-				$res = $this->client->createBucket( array(
-					'ACL' => isset( $params['noListing'] ) ? CannedAcl::PRIVATE_ACCESS : CannedAcl::PUBLIC_READ,
-					'Bucket' => $container
-				) );
-			} catch ( S3Exception $e ) {
-				$this->handleException( $e, $status, __METHOD__, $params );
-			}
-		}
-
-		$this->client->waitUntilBucketExists( array( 'Bucket' => $container ) );
-
-		$params += array(
-			'access' => empty( $params['noAccess'] ),
-			'listing' => empty( $params['noListing'] )
-		);
-
-		$status->merge( $this->doPublishInternal( $container, $dir, $params ) );
-		$status->merge( $this->doSecureInternal( $container, $dir, $params ) );
-
-		return $status;
+		return Status::newGood();;
 	}
 
 	function doCleanInternal( $container, $dir, array $params ) {
@@ -410,85 +396,11 @@ class AmazonS3FileBackend extends FileBackendStore {
 	}
 
 	function doPublishInternal( $container, $dir, array $params ) {
-		$status = Status::newGood();
-
-		if( !empty( $params['listing'] ) ) {
-			try {
-				$res = $this->client->putBucketAcl( array(
-					'ACL' => CannedAcl::PUBLIC_READ,
-					'Bucket' => $container
-				) );
-			} catch ( S3Excepton $e ) {
-				$this->handleException( $e, $status, __METHOD__, $params );
-			}
-		}
-
-		if( !empty( $params['access'] ) ) {
-			foreach( new AmazonS3FileIterator( $this->client, $container, $dir, $params ) as $key ) {
-				try {
-					$res = $this->client->putObjectAcl( array(
-						'ACL' => CannedAcl::PUBLIC_READ,
-						'Bucket' => $container,
-						'Key' => "$dir/$key"
-					) );
-				} catch ( S3Exception $e ) {
-					$this->handleException( $e, $status, __METHOD__, $params );
-				}
-			}
-		}
-
-		return $status;
+		return Status::newGood();;
 	}
 
 	function doSecureInternal( $container, $dir, array $params ) {
-		$status = Status::newGood();
-
-		if( !empty( $params['noListing'] ) ) {
-			try {
-				$res = $this->client->putBucketAcl( array(
-					'ACL' => CannedAcl::PRIVATE_ACCESS,
-					'Bucket' => $container
-				) );
-			} catch ( S3Exception $e ) {
-				$this->handleException( $e, $status, __METHOD__, $params );
-			}
-		}
-
-		if( !empty( $params['noAccess'] ) ) {
-			foreach( new AmazonS3FileIterator( $this->client, $container, $dir, $params ) as $key ) {
-				try {
-					$res = $this->client->putObjectAcl( array(
-						'ACL' => CannedAcl::PRIVATE_ACCESS,
-						'Bucket' => $container,
-						'Key' => "$dir/$key"
-					) );
-				} catch ( S3Exception $e ) {
-					$this->handleException( $e, $status, __METHOD__, $params );
-				}
-			}
-		}
-
-		return $status;
-	}
-
-	private function isSecure( $container ) {
-		static $pubUrl = "http://acs.amazonaws.com/groups/global/AllUsers";
-		try {
-			$acl = $this->client->getBucketAcl( array( 'Bucket' => $container ) );
-		} catch ( NoSuchBucketException $e ) {
-			// Non-existent buckets can't be accessed, so technically they're secure.
-			return true;
-		} catch ( S3Exception $e ) {
-			// Other error, assume insecure.
-			return false;
-		}
-
-		foreach( $acl['Grants'] as $grant ) {
-			if( isset( $grant['Grantee']['URI'] ) && $grant['Grantee']['URI'] == $pubUrl ) {
-				return false;
-			}
-		}
-		return true;
+		return Status::newGood();;
 	}
 
 	/**

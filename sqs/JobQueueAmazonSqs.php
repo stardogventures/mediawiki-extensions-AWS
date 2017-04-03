@@ -81,12 +81,16 @@ class JobQueueAmazonSqs extends JobQueue {
 			$useHTTPS = (bool)$wgAWSUseHTTPS;
 		}
 
+		$key = isset($params['aws-key']) ? $params['aws-key'] : (isset($wgAWSCredentials['key']) ? $wgAWSCredentials['key'] : null);
+		$secret = isset($params['aws-secret']) ? $params['aws-secret'] : (isset($wgAWSCredentials['secret']) ? $wgAWSCredentials['secret'] : null);
+
 		$this->client = SqsClient::factory( array(
-			'key' => isset( $params['aws-key'] ) ? $params['aws-key'] : $wgAWSCredentials['key'],
-			'secret' => isset( $params['aws-secret'] ) ? $params['aws-secret'] : $wgAWSCredentials['secret'],
+			'key' => $key,
+			'secret' => $secret,
 			'region' => isset( $params['aws-region'] ) ? $params['aws-region'] : $wgAWSRegion,
 			'scheme' => $useHTTPS ? 'https' : 'http',
-			'ssl.cert' => $useHTTPS ? true : null
+			'ssl.cert' => $useHTTPS ? true : null,
+			'version' => '2012-11-05'
 		) );
 	}
 

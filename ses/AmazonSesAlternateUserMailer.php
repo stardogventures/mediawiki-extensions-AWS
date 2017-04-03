@@ -58,9 +58,12 @@ abstract class AmazonSesAlternateUserMailer {
 			$useHTTPS = (bool)$wgAWSUseHTTPS;
 		}
 
+		$key = isset($params['aws-key']) ? $params['aws-key'] : (isset($wgAWSCredentials['key']) ? $wgAWSCredentials['key'] : null);
+		$secret = isset($params['aws-secret']) ? $params['aws-secret'] : (isset($wgAWSCredentials['secret']) ? $wgAWSCredentials['secret'] : null);
+
 		$client = SesClient::factory( array(
-			'key' => isset( $params['aws-key'] ) ? $params['aws-key'] : $wgAWSCredentials['key'],
-			'secret' => isset( $params['aws-secret'] ) ? $params['aws-secret'] : $wgAWSCredentials['secret'],
+			'key' => $key,
+			'secret' => $secret,
 			'region' => isset( $params['aws-region'] ) ? $params['aws-region'] : $wgAWSRegion,
 			'scheme' => $useHTTPS ? 'https' : 'http',
 			'ssl.certificate_authority' => $useHTTPS ?: null
